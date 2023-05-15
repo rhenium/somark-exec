@@ -1,0 +1,97 @@
+#!/usr/bin/env ruby
+# Usage: somark-exec.rb MARK cmd ...
+
+require "fiddle/import"
+
+module Sys
+  extend Fiddle::Importer
+  dlload Fiddle.dlopen(nil)
+
+  case RUBY_PLATFORM
+  when /x86_64-linux/
+    SYS_bpf = 321
+  when /aarch64-linux/
+    SYS_bpf = 280
+  else
+    raise "I don't know the syscall number for bpf on this RUBY_PLATFORM: #{RUBY_PLATFORM}"
+  end
+  extern "long syscall(long number, int cmd, void *attr, unsigned int size)"
+
+  BPF_PROG_LOAD = 5
+  BPF_PROG_ATTACH = 8
+
+  BPF_F_REPLACE = 4
+
+  BPF_PROG_TYPE_CGROUP_SOCK = 9
+
+  BPF_CGROUP_INET_SOCK_CREATE = 2
+
+  module_function
+
+  def bpf_prog_load(prog_type, insns)
+    buf = [
+      prog_type,        # u32
+      insns.size,       # u32
+      insns.pack("Q*"), # u64 (pointer)
+      "MIT",            # u64 (pointer)
+    ].pack("LLpp")
+    ret = syscall(SYS_bpf, BPF_PROG_LOAD, buf, buf.size)
+    raise "bpf(BPF_PROG_LOAD) failed with errno=#{Fiddle.last_error}" if ret == -1
+    ret
+  end
+
+  def bpf_prog_attach(target_fd, bpf_fd, attach_type)
+    buf = [
+      target_fd,     # u32
+      bpf_fd,        # u32
+      attach_type,   # u32
+      0,             # u32
+      BPF_F_REPLACE, # u32
+    ].pack("LLLLL")
+    ret = syscall(SYS_bpf, BPF_PROG_ATTACH, buf, buf.size)
+    raise "bpf(BPF_PROG_ATTACH) failed with errno=#{Fiddle.last_error}" if ret == -1
+    ret
+  end
+end
+
+# TODO: Proper argument parsing?
+args_mark = Integer(ARGV[0])
+raise "bad mark: #{args_mark}" if args_mark < 0 || args_mark.bit_length > 32
+args_command = ARGV[1..-1]
+raise "bad command: #{args_command}" if args_command.empty?
+
+# Step 1: Create a new cgroup for the mark (if it does not exist)
+cgroup_mount = File.readlines("/proc/mounts").find { |l|
+  # FIXME: This is probably wrong. What if path contains spaces?
+  c = l.split(" ")
+  break c[1] if c[2] == "cgroup2"
+} or raise "cgroup2 mount point not found"
+current_cgroup = File.read("/proc/self/cgroup").sub(%r{\A\d+::/}, "").chomp
+target_cgroup = File.join(cgroup_mount, current_cgroup, "somark-exec-#{args_mark}")
+Dir.mkdir(target_cgroup) if !File.directory?(target_cgroup)
+cgroup_fd = Dir.open(target_cgroup).fileno
+
+# Step 2: Load eBPF program and attach it to the cgroup
+# XXX: Why can't I just do {stw [r1+offsetof(struct bpf_sock, mark)], args_mark}?
+prog = [
+  # mov r0, args_mark
+  0x00000000000000b7 | (args_mark << 32),
+  # stxw [r1+offsetof(struct bpf_sock, mark)], r0
+  #   <-- offsetof(struct bpf_sock, mark) == 0x10
+  0x0000000000100163,
+  # mov r0, 1
+  #   <-- return 1 == allow, anything else will be EPERM
+  0x00000001000000b7,
+  # exit
+  0x0000000000000095,
+]
+prog_fd = Sys.bpf_prog_load(Sys::BPF_PROG_TYPE_CGROUP_SOCK, prog)
+Sys.bpf_prog_attach(cgroup_fd, prog_fd, Sys::BPF_CGROUP_INET_SOCK_CREATE)
+
+# Step 3: Attach myself to the cgroup
+File.open(File.join(target_cgroup, "cgroup.procs"), "a") { |f|
+  f.puts Process.pid
+}
+
+# Step 4: Exec command
+exec(args_command.shift, *args_command)
