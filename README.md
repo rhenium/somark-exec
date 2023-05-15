@@ -1,7 +1,8 @@
 somark-exec
 ===========
 
-This script enables `SO_MARK`-unaware applications to run with a socket mark.
+This script enables `SO_MARK`-unaware Linux applications to run with a socket
+mark.
 
 While there are alternative methods to accomplish similar results, such as
 l3mdev VRF or nftables matching based on socket UID, they require complicated
